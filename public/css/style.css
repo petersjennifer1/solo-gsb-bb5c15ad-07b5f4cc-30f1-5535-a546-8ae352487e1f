@@ -84,6 +84,15 @@ button {
 button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
 
+/* 导出校准扫描图不可用时的原因提示 */
+.export-hint {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+  min-height: 0;
+}
+.export-hint:empty { display: none; }
+
 .status {
   padding: 10px 14px;
   border-radius: 6px;

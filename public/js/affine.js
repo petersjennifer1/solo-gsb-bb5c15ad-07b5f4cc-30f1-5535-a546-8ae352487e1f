@@ -23,6 +23,13 @@
  * 对每个参与拟合的点，移除后用其余参与点重新最小二乘拟合，再预测该留出点
  * 的目标位置并计算误差；参与点不足 4 个或留出后点集近共线时该点标记
  * 「无法验证」，汇总仅统计可验证点。稳健模式的参与集为最终内点，外点不参与。
+ *
+ * RGBA 像素变换（transformRGBA，可独立调用）：将源 RGBA 像素数组按拟合矩阵
+ * （源 → 输出坐标系）变换到指定尺寸的输出画布。对每个输出像素，其像素中心
+ * (i+0.5, j+0.5) 经逆仿射映射回源图连续坐标取样，以四邻像素做双线性插值；
+ * 越界邻点视为透明黑；颜色先乘 alpha 再插值、输出时还原，alpha 为零时
+ * RGB 归零；各通道四舍五入到 0~255。矩阵含非有限值或线性部分行列式绝对值
+ * ≤ MIN_MATRIX_DET（1e-12）时拒绝（checkExportMatrix / invertMatrix）。
  */
 (function (root, factory) {
   const api = factory();
@@ -40,6 +47,8 @@
   const MAX_REFINE_ITERS = 16;
   // 稳健模式默认参考图像素容差
   const DEFAULT_TOLERANCE_PX = 2;
+  // 像素变换/导出可用性的矩阵阈值：线性部分行列式 |a·e − b·d| 下限
+  const MIN_MATRIX_DET = 1e-12;
 
   class FitError extends Error {
     constructor(code, message) {
@@ -380,17 +389,147 @@
     return { x: m.a * p.x + m.b * p.y + m.c, y: m.d * p.x + m.e * p.y + m.f };
   }
 
+  /**
+   * 校验矩阵是否可用于像素变换/导出：六参数均为有限值，且线性部分
+   * 行列式 |a·e − b·d| > MIN_MATRIX_DET（1e-12），否则不可逆。
+   * @param {{a,b,c,d,e,f}} m
+   * @returns {{ok:true, det:number} | {ok:false, reason:string}} reason 为中文原因
+   */
+  function checkExportMatrix(m) {
+    if (!m) return { ok: false, reason: '拟合矩阵缺失' };
+    for (const k of ['a', 'b', 'c', 'd', 'e', 'f']) {
+      if (!Number.isFinite(m[k])) {
+        return { ok: false, reason: '拟合矩阵含非有限值，无法求逆做像素变换' };
+      }
+    }
+    const det = m.a * m.e - m.b * m.d;
+    if (!Number.isFinite(det) || Math.abs(det) <= MIN_MATRIX_DET) {
+      return { ok: false, reason: '拟合矩阵线性部分行列式绝对值 ≤ 1e-12，不可逆，无法做像素变换' };
+    }
+    return { ok: true, det };
+  }
+
+  /**
+   * 求六参数仿射矩阵的逆（先经 checkExportMatrix 校验）。
+   * 正向 u = a·x + b·y + c，v = d·x + e·y + f 的逆映射为：
+   *   x = ( e·(u−c) − b·(v−f)) / det
+   *   y = (−d·(u−c) + a·(v−f)) / det
+   * @throws {FitError} code = BAD_MATRIX（非有限值或行列式绝对值 ≤ 1e-12）
+   */
+  function invertMatrix(m) {
+    const chk = checkExportMatrix(m);
+    if (!chk.ok) throw new FitError('BAD_MATRIX', chk.reason);
+    const det = chk.det;
+    return {
+      a: m.e / det,
+      b: -m.b / det,
+      c: (m.b * m.f - m.e * m.c) / det,
+      d: -m.d / det,
+      e: m.a / det,
+      f: (m.d * m.c - m.a * m.f) / det
+    };
+  }
+
+  /** 通道四舍五入并钳制到 0~255 */
+  function clampRound(v) {
+    const r = Math.round(v);
+    return r < 0 ? 0 : r > 255 ? 255 : r;
+  }
+
+  /**
+   * RGBA 像素变换（可独立调用，纯像素计算，不依赖 DOM/Canvas）。
+   *
+   * 将源 RGBA 像素数组按拟合矩阵 matrix（源 → 输出坐标系）重采样到
+   * outW × outH 的输出画布：对每个输出像素 (i, j)，取其像素中心
+   * (i+0.5, j+0.5)，经逆仿射映射回源图连续坐标，以四邻像素做双线性插值
+   * （源像素中心同样位于 (x+0.5, y+0.5)）。规则：
+   *   - 越界邻点视为透明黑 (0,0,0,0)，不参与贡献；
+   *   - 颜色先乘 alpha（预乘）再插值，输出时除以插值后的 alpha 还原；
+   *   - 插值后 alpha 为零时 RGB 归零；
+   *   - 各通道四舍五入到 0~255。
+   *
+   * @param {Uint8Array|Uint8ClampedArray} srcData 源 RGBA 数据（长度 srcW·srcH·4）
+   * @param {number} srcW 源图宽（正整数）
+   * @param {number} srcH 源图高（正整数）
+   * @param {{a,b,c,d,e,f}} matrix 正向仿射矩阵（源 → 输出坐标系）
+   * @param {number} outW 输出宽（正整数）
+   * @param {number} outH 输出高（正整数）
+   * @returns {Uint8ClampedArray} 输出 RGBA 数据（长度 outW·outH·4）
+   * @throws {FitError} code ∈ BAD_INPUT | BAD_MATRIX
+   */
+  function transformRGBA(srcData, srcW, srcH, matrix, outW, outH) {
+    if (!srcData || !Number.isInteger(srcW) || !Number.isInteger(srcH) ||
+        srcW <= 0 || srcH <= 0 || srcData.length !== srcW * srcH * 4) {
+      throw new FitError('BAD_INPUT', '源像素数据缺失或长度与源图宽高不符');
+    }
+    if (!Number.isInteger(outW) || !Number.isInteger(outH) || outW <= 0 || outH <= 0) {
+      throw new FitError('BAD_INPUT', '输出宽高必须为正整数');
+    }
+    const inv = invertMatrix(matrix); // 含非有限值 / 行列式校验
+
+    const out = new Uint8ClampedArray(outW * outH * 4);
+    for (let j = 0; j < outH; j++) {
+      // 输出像素中心 (i+0.5, j+0.5) 经逆仿射映射回源图连续坐标
+      const baseX = inv.b * (j + 0.5) + inv.c;
+      const baseY = inv.e * (j + 0.5) + inv.f;
+      for (let i = 0; i < outW; i++) {
+        const sx = inv.a * (i + 0.5) + baseX;
+        const sy = inv.d * (i + 0.5) + baseY;
+        // 源像素中心位于 (x+0.5, y+0.5)：换算到像素索引空间取四邻
+        const fx = sx - 0.5, fy = sy - 0.5;
+        const x0 = Math.floor(fx), y0 = Math.floor(fy);
+        const tx = fx - x0, ty = fy - y0;
+        // 双线性插值（颜色预乘 alpha；越界邻点为透明黑，不贡献）
+        let r = 0, g = 0, b = 0, alpha = 0;
+        for (let dy = 0; dy <= 1; dy++) {
+          const yy = y0 + dy;
+          const wy = dy === 0 ? 1 - ty : ty;
+          if (wy === 0) continue;
+          for (let dx = 0; dx <= 1; dx++) {
+            const xx = x0 + dx;
+            const w = wy * (dx === 0 ? 1 - tx : tx);
+            if (w === 0) continue;
+            if (xx < 0 || xx >= srcW || yy < 0 || yy >= srcH) continue; // 透明黑
+            const idx = (yy * srcW + xx) * 4;
+            const sa = srcData[idx + 3] / 255;
+            r += w * srcData[idx] * sa;
+            g += w * srcData[idx + 1] * sa;
+            b += w * srcData[idx + 2] * sa;
+            alpha += w * srcData[idx + 3];
+          }
+        }
+        const o = (j * outW + i) * 4;
+        if (alpha <= 0) {
+          // alpha 为零时 RGB 归零（透明黑）
+          out[o] = 0; out[o + 1] = 0; out[o + 2] = 0; out[o + 3] = 0;
+        } else {
+          // 输出时还原预乘：除以插值后的 alpha
+          const sa = alpha / 255;
+          out[o] = clampRound(r / sa);
+          out[o + 1] = clampRound(g / sa);
+          out[o + 2] = clampRound(b / sa);
+          out[o + 3] = clampRound(alpha);
+        }
+      }
+    }
+    return out;
+  }
+
   return {
     fitAffine,
     fitAffineRobust,
     leaveOneOutValidation,
     applyMatrix,
     collinearity,
+    checkExportMatrix,
+    invertMatrix,
+    transformRGBA,
     FitError,
     MIN_POINTS,
     COLLINEAR_RATIO,
     MAX_CANDIDATES,
     MAX_REFINE_ITERS,
-    DEFAULT_TOLERANCE_PX
+    DEFAULT_TOLERANCE_PX,
+    MIN_MATRIX_DET
   };
 });

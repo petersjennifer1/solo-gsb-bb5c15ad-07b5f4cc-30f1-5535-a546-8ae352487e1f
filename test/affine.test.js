@@ -359,4 +359,124 @@ function apply(m, p) {
   console.log('✓ 留出验证：leaveOneOutValidation 可独立调用，inliers 参数生效');
 }
 
+// ---------- RGBA 像素变换 transformRGBA / checkExportMatrix ----------
+
+const IDENTITY = { a: 1, b: 0, c: 0, d: 0, e: 1, f: 0 };
+
+// 27. 恒等矩阵：像素中心对齐，输出与输入逐像素一致
+{
+  const src = new Uint8ClampedArray([
+    255, 0, 0, 255,   0, 255, 0, 255,
+    0, 0, 255, 255,   255, 255, 0, 128
+  ]);
+  const out = Affine.transformRGBA(src, 2, 2, IDENTITY, 2, 2);
+  assert.ok(out instanceof Uint8ClampedArray);
+  assert.strictEqual(out.length, 2 * 2 * 4);
+  assert.deepStrictEqual(Array.from(out), Array.from(src));
+  console.log('✓ transformRGBA 恒等矩阵逐像素还原（像素中心 (i+0.5, j+0.5) 对齐）');
+}
+
+// 28. 整数平移：c=1 时输出第 i 列 = 源第 i−1 列，第 0 列越界为透明黑
+{
+  const src = new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]); // 3×1 红绿蓝
+  const out = Affine.transformRGBA(src, 3, 1, { ...IDENTITY, c: 1 }, 3, 1);
+  assert.deepStrictEqual(Array.from(out.slice(0, 4)), [0, 0, 0, 0], '越界邻点应为透明黑');
+  assert.deepStrictEqual(Array.from(out.slice(4, 8)), [255, 0, 0, 255]);
+  assert.deepStrictEqual(Array.from(out.slice(8, 12)), [0, 255, 0, 255]);
+  console.log('✓ transformRGBA 逆仿射取样：平移后越界邻点为透明黑');
+}
+
+// 29. 双线性插值：颜色先乘 alpha 再插值、输出时还原（半透明边界不串色）
+{
+  // 源 2×1：不透明红 + 全透明（RGB 为杂值）；在两像素中心中点取样
+  const src = new Uint8ClampedArray([255, 0, 0, 255, 0, 0, 255, 0]);
+  const out = Affine.transformRGBA(src, 2, 1, { ...IDENTITY, c: -0.5 }, 1, 1);
+  // 预乘：r = 0.5·255·1 + 0.5·(0·0) = 127.5，alpha = 127.5 → 还原 r = 255，alpha = round(127.5) = 128
+  assert.deepStrictEqual(Array.from(out), [255, 0, 0, 128],
+    '颜色须先乘 alpha 再插值、输出时还原（未预乘会得到 r=128）');
+  console.log('✓ transformRGBA 预乘 alpha 插值并还原（透明像素不串色）');
+}
+
+// 30. alpha 为零时 RGB 归零
+{
+  const src = new Uint8ClampedArray([10, 20, 30, 0]); // 1×1 全透明但 RGB 非零
+  const out = Affine.transformRGBA(src, 1, 1, IDENTITY, 1, 1);
+  assert.deepStrictEqual(Array.from(out), [0, 0, 0, 0], 'alpha 为零时 RGB 必须归零');
+  console.log('✓ transformRGBA alpha 为零时 RGB 归零');
+}
+
+// 31. 通道四舍五入到 0~255（0.5 → 1，而非银行家舍入的 0）
+{
+  const src = new Uint8ClampedArray([1, 0, 0, 255, 0, 0, 0, 255]); // 2×1：r=1 与 r=0
+  const out = Affine.transformRGBA(src, 2, 1, { ...IDENTITY, c: -0.5 }, 1, 1);
+  assert.strictEqual(out[0], 1, '0.5 应四舍五入为 1');
+  assert.strictEqual(out[3], 255);
+  console.log('✓ transformRGBA 通道四舍五入到 0~255');
+}
+
+// 32. 放大 2 倍：边缘覆盖不足时与透明黑混合，内部精确还原
+{
+  // 源 2×2 均匀灰 (100,100,100,255) → 输出 4×4
+  const src = new Uint8ClampedArray(2 * 2 * 4);
+  for (let k = 0; k < 4; k++) { src[k * 4] = 100; src[k * 4 + 1] = 100; src[k * 4 + 2] = 100; src[k * 4 + 3] = 255; }
+  const out = Affine.transformRGBA(src, 2, 2, { a: 2, b: 0, c: 0, d: 0, e: 2, f: 0 }, 4, 4);
+  // 角像素 (0,0)：中心 (0.5,0.5) 逆映射到 (0.25,0.25)，仅 0.75×0.75 覆盖源像素
+  const corner = [100, 100, 100, Math.round(0.75 * 0.75 * 255)];
+  assert.deepStrictEqual(Array.from(out.slice(0, 4)), corner, '边缘应与透明黑按覆盖率混合');
+  // 中心像素 (1,1)：中心 (1.5,1.5) 逆映射到 (0.75,0.75)，完全落在源内
+  const center = Array.from(out.slice((1 * 4 + 1) * 4, (1 * 4 + 1) * 4 + 4));
+  assert.deepStrictEqual(center, [100, 100, 100, 255], '完全覆盖区域应精确还原');
+  console.log('✓ transformRGBA 放大采样：边缘与透明黑混合、内部精确');
+}
+
+// 33. 非法矩阵拒绝：非有限值 / 行列式绝对值 ≤ 1e-12
+{
+  const src = new Uint8ClampedArray(4);
+  assert.throws(() => Affine.transformRGBA(src, 1, 1, { ...IDENTITY, a: NaN }, 1, 1),
+    (e) => e.code === 'BAD_MATRIX' && /非有限值/.test(e.message));
+  assert.throws(() => Affine.transformRGBA(src, 1, 1, { ...IDENTITY, c: Infinity }, 1, 1),
+    (e) => e.code === 'BAD_MATRIX');
+  // 奇异矩阵：det = 0
+  assert.throws(() => Affine.transformRGBA(src, 1, 1, { a: 1, b: 1, c: 0, d: 1, e: 1, f: 0 }, 1, 1),
+    (e) => e.code === 'BAD_MATRIX' && /行列式/.test(e.message));
+  // det = 1e-13 ≤ 1e-12：拒绝；det = 1e-11 > 1e-12：允许
+  assert.throws(() => Affine.transformRGBA(src, 1, 1, { a: 1e-13, b: 0, c: 0, d: 0, e: 1, f: 0 }, 1, 1),
+    (e) => e.code === 'BAD_MATRIX');
+  const ok = Affine.transformRGBA(src, 1, 1, { a: 1e-11, b: 0, c: 0, d: 0, e: 1, f: 0 }, 1, 1);
+  assert.strictEqual(ok.length, 4);
+  // 非法像素数据 / 输出尺寸
+  assert.throws(() => Affine.transformRGBA(null, 1, 1, IDENTITY, 1, 1), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.transformRGBA(src, 2, 1, IDENTITY, 1, 1), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.transformRGBA(src, 1, 1, IDENTITY, 0, 1), (e) => e.code === 'BAD_INPUT');
+  console.log('✓ transformRGBA 拒绝非有限值 / 近奇异矩阵 / 非法输入');
+}
+
+// 34. checkExportMatrix：导出前校验（不抛异常，返回原因）
+{
+  assert.strictEqual(Affine.checkExportMatrix(IDENTITY).ok, true);
+  assert.strictEqual(Affine.checkExportMatrix(TRUE_M).ok, true);
+  const nan = Affine.checkExportMatrix({ ...IDENTITY, e: NaN });
+  assert.strictEqual(nan.ok, false);
+  assert.ok(/非有限值/.test(nan.reason));
+  const singular = Affine.checkExportMatrix({ a: 2, b: 1, c: 0, d: 4, e: 2, f: 0 }); // det = 0
+  assert.strictEqual(singular.ok, false);
+  assert.ok(/行列式/.test(singular.reason));
+  const tiny = Affine.checkExportMatrix({ a: 1e-12, b: 0, c: 0, d: 0, e: 1, f: 0 }); // det = 1e-12 ≤ 阈值
+  assert.strictEqual(tiny.ok, false);
+  assert.strictEqual(Affine.checkExportMatrix(null).ok, false);
+  console.log('✓ checkExportMatrix 校验非有限值与行列式阈值并给出原因');
+}
+
+// 35. invertMatrix：逆矩阵与正向矩阵复合为恒等
+{
+  const inv = Affine.invertMatrix(TRUE_M);
+  const p = { x: 123.4, y: -56.7 };
+  const q = apply(TRUE_M, p);
+  const back = Affine.applyMatrix(inv, q);
+  assert.ok(Math.hypot(back.x - p.x, back.y - p.y) < 1e-9, '逆映射应还原原坐标');
+  assert.throws(() => Affine.invertMatrix({ a: 1, b: 1, c: 0, d: 1, e: 1, f: 0 }),
+    (e) => e.code === 'BAD_MATRIX');
+  console.log('✓ invertMatrix 逆映射正确，奇异矩阵抛 BAD_MATRIX');
+}
+
 console.log('\n全部测试通过 ✔');

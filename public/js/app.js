@@ -8,6 +8,11 @@
  *    再对内点重新最小二乘拟合；外点在双图标记与残差表中区分显示，
  *    不计入 RMSE。容差调整、点位编辑/删除均同步重算。
  *  - 叠加预览与两种 JSON 导出共用同一最终矩阵，导出记录内/外点身份
+ *  - 「导出校准扫描图」：用点击时的扫描图与最终拟合矩阵（两种模式均可），
+ *    经 Affine.transformRGBA 逆仿射重采样（四邻双线性插值、预乘 alpha、
+ *    越界透明黑），下载与参考图原始宽高一致、仅含变换后扫描图的 PNG；
+ *    图像缺失 / 拟合无效 / 矩阵含非有限值 / 行列式 |det| ≤ 1e-12 时禁用并说明原因。
+ *    像素处理全部在浏览器本地完成，图像不上传服务器。
  *  - 残差实时列表，内点最大残差橙色高亮、外点红色标识；近共线拒绝并提示
  *  - 逐点留出验证（复用 affine.js 的 leaveOneOutValidation，与 /api/fit 输出一致）：
  *    残差表「留出验证」列显示每个参与点的留出误差；参与点不足 4 个或留出后
@@ -52,6 +57,8 @@
   const opacityVal = $('opacityVal');
   const btnExportMatrix = $('btnExportMatrix');
   const btnExportResiduals = $('btnExportResiduals');
+  const btnExportImage = $('btnExportImage');
+  const exportImgHint = $('exportImgHint');
   const btnClear = $('btnClear');
   const robustModeInput = $('robustMode');
   const toleranceInput = $('tolerance');
@@ -459,11 +466,34 @@
     }).join('');
   }
 
+  // 导出校准扫描图的前置条件；不满足时给出中文原因（禁用提示 + 点击兜底）
+  function exportImageReadiness() {
+    if (!state.refImg || !state.scanImg) {
+      return { ok: false, reason: '图像缺失，请先上传参考图与扫描图' };
+    }
+    if (state.fitError) {
+      return { ok: false, reason: '拟合无效：' + state.fitError };
+    }
+    if (!state.fit) {
+      return { ok: false, reason: `拟合无效：控制点不足 ${Affine.MIN_POINTS} 对` };
+    }
+    const chk = Affine.checkExportMatrix(state.fit.matrix);
+    if (!chk.ok) return { ok: false, reason: chk.reason };
+    return { ok: true };
+  }
+
   function renderButtons() {
     const hasFit = !!state.fit;
     btnExportMatrix.disabled = !hasFit;
     btnExportResiduals.disabled = !hasFit;
     btnClear.disabled = state.points.length === 0 && !state.pending.ref && !state.pending.scan;
+    // 导出校准扫描图：随重算结果实时启用/禁用，禁用时说明原因
+    const ready = exportImageReadiness();
+    btnExportImage.disabled = !ready.ok;
+    btnExportImage.title = ready.ok
+      ? '下载与参考图同尺寸的 PNG：仅含按最终矩阵变换后的扫描图（逆仿射 + 双线性插值，本地处理）'
+      : ready.reason;
+    exportImgHint.textContent = ready.ok ? '' : '暂不可导出校准扫描图：' + ready.reason;
   }
 
   function render() {
@@ -550,6 +580,57 @@
     });
   }
 
+  // 导出校准扫描图：与参考图原始宽高一致的 PNG，仅含按最终矩阵变换后的
+  // 扫描图（无参考底图、无标记、无预览透明度）；像素处理全部在浏览器本地完成
+  function exportCalibratedImage() {
+    const ready = exportImageReadiness();
+    if (!ready.ok) { // 按钮禁用时的兜底（如键盘触发）
+      setStatus('无法导出校准扫描图：' + ready.reason, 'error');
+      return;
+    }
+    try {
+      // 点击时重新读取当前扫描图像素（本地 canvas，不上传服务器）
+      const sw = state.scanImg.naturalWidth;
+      const sh = state.scanImg.naturalHeight;
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = sw;
+      srcCanvas.height = sh;
+      const sctx = srcCanvas.getContext('2d');
+      sctx.drawImage(state.scanImg, 0, 0);
+      const srcData = sctx.getImageData(0, 0, sw, sh).data;
+
+      // 输出尺寸 = 参考图原始宽高；逆仿射重采样（四邻双线性插值）
+      const outW = state.refImg.naturalWidth;
+      const outH = state.refImg.naturalHeight;
+      const pixels = Affine.transformRGBA(srcData, sw, sh, state.fit.matrix, outW, outH);
+
+      const outCanvas = document.createElement('canvas');
+      outCanvas.width = outW;
+      outCanvas.height = outH;
+      outCanvas.getContext('2d').putImageData(new ImageData(pixels, outW, outH), 0, 0);
+      outCanvas.toBlob((blob) => {
+        if (!blob) {
+          setStatus('导出校准扫描图失败：浏览器未能生成 PNG。', 'error');
+          return;
+        }
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'calibrated-scan.png';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+        setStatus(
+          `已导出校准扫描图 calibrated-scan.png（${outW}×${outH} PNG，` +
+          `仅含按最终矩阵变换后的扫描图，模式：${state.robust ? '稳健' : '经典最小二乘'}）。`,
+          'ok'
+        );
+      }, 'image/png');
+    } catch (err) {
+      setStatus('无法导出校准扫描图：' + (err.message || String(err)), 'error');
+    }
+  }
+
   // ---------- 示例图像 ----------
   function drawSampleContent(g, w, h) {
     g.fillStyle = '#f8fafc';
@@ -615,6 +696,7 @@
     btnClear.addEventListener('click', clearPoints);
     btnExportMatrix.addEventListener('click', exportMatrix);
     btnExportResiduals.addEventListener('click', exportResiduals);
+    btnExportImage.addEventListener('click', exportCalibratedImage);
 
     opacityInput.addEventListener('input', () => {
       state.opacity = parseFloat(opacityInput.value);
