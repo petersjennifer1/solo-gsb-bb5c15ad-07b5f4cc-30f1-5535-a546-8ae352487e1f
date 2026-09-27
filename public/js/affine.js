@@ -380,17 +380,147 @@
     return { x: m.a * p.x + m.b * p.y + m.c, y: m.d * p.x + m.e * p.y + m.f };
   }
 
+  // ---------- RGBA 像素逆仿射变换（导出校准扫描图用，可独立调用） ----------
+
+  // 线性部分行列式绝对值小于该阈值视为退化（不可逆），禁止重采样
+  const SINGULAR_DET_EPS = 1e-12;
+
+  class WarpError extends Error {
+    constructor(code, message) {
+      super(message);
+      this.name = 'WarpError';
+      this.code = code;
+    }
+  }
+
+  /**
+   * 求六参数仿射矩阵的逆（扫描图→参考图 的逆：参考图→扫描图）。
+   * @param {{a,b,c,d,e,f}} m 正向仿射矩阵
+   * @returns {{a,b,c,d,e,f}} 逆矩阵
+   * @throws {WarpError} code ∈ BAD_MATRIX（含非有限值）| SINGULAR_MATRIX（行列式退化）
+   */
+  function invertAffine(m) {
+    if (!m || ['a', 'b', 'c', 'd', 'e', 'f'].some((k) => !Number.isFinite(m[k]))) {
+      throw new WarpError('BAD_MATRIX', '仿射矩阵参数缺失或含非有限值（NaN/Infinity），无法导出校准扫描图');
+    }
+    const det = m.a * m.e - m.b * m.d;
+    if (!Number.isFinite(det) || Math.abs(det) <= SINGULAR_DET_EPS) {
+      throw new WarpError('SINGULAR_MATRIX', `仿射矩阵线性部分行列式绝对值 ${Math.abs(det)} ≤ ${SINGULAR_DET_EPS}，矩阵不可逆，无法导出校准扫描图`);
+    }
+    const ia = m.e / det, ib = -m.b / det;
+    const id = -m.d / det, ie = m.a / det;
+    return {
+      a: ia, b: ib, c: -(ia * m.c + ib * m.f),
+      d: id, e: ie, f: -(id * m.c + ie * m.f)
+    };
+  }
+
+  function clamp255(v) { return v <= 0 ? 0 : v >= 255 ? 255 : v; }
+
+  /**
+   * RGBA 像素逆仿射重采样（预乘 alpha 双线性插值）。
+   *
+   * 对目标（参考图坐标系）输出画布的每个像素，以像素中心 (i+0.5, j+0.5)
+   * （i 为列号/x，j 为行号/y）经正向矩阵 m 的逆映射回源（扫描图）坐标，
+   * 取该位置四邻像素做双线性插值：
+   *   - 越界邻点视为透明黑（RGBA = 0,0,0,0），故边缘按 alpha 自然衰减；
+   *   - 颜色先乘 alpha 再按权重插值，输出时除以 alpha 还原，避免半透明
+   *     像素与透明黑混合后出现颜色镶边；
+   *   - 插值后 alpha 为 0（或负值/非有限）时 RGB 归零；
+   *   - 各通道四舍五入并截断到 0～255。
+   *
+   * 纯函数：只读取 srcImageData，不修改输入；在浏览器与 Node 中均可独立
+   * 调用（Node 下传入含 {width,height,data:Uint8ClampedArray} 的对象即可）。
+   *
+   * @param {{width:number,height:number,data:(Uint8ClampedArray|number[])}} srcImageData
+   *        源 RGBA 像素（扫描图原始分辨率）
+   * @param {{a,b,c,d,e,f}} matrix 扫描图→参考图 的最终拟合矩阵
+   * @param {number} outWidth 输出宽（参考图原始宽）
+   * @param {number} outHeight 输出高（参考图原始高）
+   * @returns {{width:number,height:number,data:Uint8ClampedArray}} 变换后的 RGBA 像素
+   * @throws {WarpError} code ∈ BAD_MATRIX | SINGULAR_MATRIX | BAD_IMAGEDATA
+   */
+  function warpRGBA(srcImageData, matrix, outWidth, outHeight) {
+    const inv = invertAffine(matrix);
+    const sw = srcImageData && srcImageData.width;
+    const sh = srcImageData && srcImageData.height;
+    const sdata = srcImageData && srcImageData.data;
+    if (!Number.isInteger(sw) || !Number.isInteger(sh) || sw <= 0 || sh <= 0 ||
+        !sdata || sdata.length < sw * sh * 4 ||
+        !Number.isInteger(outWidth) || !Number.isInteger(outHeight) || outWidth <= 0 || outHeight <= 0) {
+      throw new WarpError('BAD_IMAGEDATA', '图像像素数据或输出尺寸无效，无法导出校准扫描图');
+    }
+
+    const out = new Uint8ClampedArray(outWidth * outHeight * 4);
+
+    // 取源像素 (x,y) 的预乘值（r·α, g·α, b·α, α/255）；越界返回透明黑
+    const sample = (x, y, w) => {
+      if (x < 0 || y < 0 || x >= sw || y >= sh) { w[0] = w[1] = w[2] = w[3] = 0; return; }
+      const o = (y * sw + x) * 4;
+      const a = sdata[o + 3] / 255;
+      w[0] = sdata[o] * a;
+      w[1] = sdata[o + 1] * a;
+      w[2] = sdata[o + 2] * a;
+      w[3] = a;
+    };
+
+    const w00 = [0, 0, 0, 0], w10 = [0, 0, 0, 0], w01 = [0, 0, 0, 0], w11 = [0, 0, 0, 0];
+    let op = 0;
+    for (let j = 0; j < outHeight; j++) {
+      for (let i = 0; i < outWidth; i++) {
+        // 输出像素中心 (i+0.5, j+0.5) → 逆映射到源坐标 (sx, sy)
+        const cx = i + 0.5, cy = j + 0.5;
+        const sx = inv.a * cx + inv.b * cy + inv.c;
+        const sy = inv.d * cx + inv.e * cy + inv.f;
+        if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
+          out[op] = out[op + 1] = out[op + 2] = out[op + 3] = 0;
+          op += 4;
+          continue;
+        }
+
+        const x0 = Math.floor(sx - 0.5), y0 = Math.floor(sy - 0.5);
+        // 采样点中心坐标减去邻点像素中心：双线性权重
+        const tx = sx - (x0 + 0.5), ty = sy - (y0 + 0.5);
+        const w00w = (1 - tx) * (1 - ty), w10w = tx * (1 - ty);
+        const w01w = (1 - tx) * ty,       w11w = tx * ty;
+
+        sample(x0,     y0,     w00);
+        sample(x0 + 1, y0,     w10);
+        sample(x0,     y0 + 1, w01);
+        sample(x0 + 1, y0 + 1, w11);
+
+        // 预乘空间加权插值（权重非负且和为 1，结果不会越界）
+        const pa = w00w * w00[0] + w10w * w10[0] + w01w * w01[0] + w11w * w11[0];
+        const pg = w00w * w00[1] + w10w * w10[1] + w01w * w01[1] + w11w * w11[1];
+        const pb = w00w * w00[2] + w10w * w10[2] + w01w * w01[2] + w11w * w11[2];
+        const pw = w00w * w00[3] + w10w * w10[3] + w01w * w01[3] + w11w * w11[3];
+
+        out[op]     = clamp255(Math.round(pw > 0 ? pa / pw : 0));
+        out[op + 1] = clamp255(Math.round(pw > 0 ? pg / pw : 0));
+        out[op + 2] = clamp255(Math.round(pw > 0 ? pb / pw : 0));
+        out[op + 3] = clamp255(Math.round(pw * 255));
+        op += 4;
+      }
+    }
+
+    return { width: outWidth, height: outHeight, data: out };
+  }
+
   return {
     fitAffine,
     fitAffineRobust,
     leaveOneOutValidation,
     applyMatrix,
+    invertAffine,
+    warpRGBA,
     collinearity,
     FitError,
+    WarpError,
     MIN_POINTS,
     COLLINEAR_RATIO,
     MAX_CANDIDATES,
     MAX_REFINE_ITERS,
-    DEFAULT_TOLERANCE_PX
+    DEFAULT_TOLERANCE_PX,
+    SINGULAR_DET_EPS
   };
 });

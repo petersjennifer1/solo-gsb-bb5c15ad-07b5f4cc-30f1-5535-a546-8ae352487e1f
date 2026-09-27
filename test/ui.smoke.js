@@ -17,8 +17,46 @@ const path = require('path');
 const requestedIds = new Set();
 const els = {};
 
-function makeCtx() {
-  return new Proxy({}, { get: () => () => {}, set: () => true });
+// 离屏 canvas 的 RGBA 像素缓冲（按 canvas 实例保存），供导出 PNG 流程验证
+const canvasPixels = new WeakMap();
+const exportedBlobs = []; // canvas.toBlob 产生的 PNG blob
+global.ImageData = class ImageData {
+  constructor(data, width, height) { this.data = data; this.width = width; this.height = height; }
+};
+
+function makeCtx(canvas) {
+  // 常用方法空操作；与像素相关的方法在离屏 canvas 上维护确定性 RGBA 缓冲
+  const ctx = {
+    fillStyle: '', strokeStyle: '', font: '', textAlign: '', textBaseline: '',
+    lineWidth: 1, globalAlpha: 1,
+    fillRect() {}, strokeRect() {}, clearRect() {}, beginPath() {}, moveTo() {},
+    lineTo() {}, arc() {}, stroke() {}, fillText() {}, strokeText() {}, save() {},
+    restore() {}, setLineDash() {}, setTransform() {}, drawImage() {},
+    getImageData(x, y, w, h) {
+      const buf = canvasPixels.get(canvas) || new Uint8ClampedArray(canvas.width * canvas.height * 4);
+      return new global.ImageData(buf.slice(0, w * h * 4), w, h);
+    },
+    putImageData(imageData) {
+      canvasPixels.set(canvas, new Uint8ClampedArray(imageData.data));
+    },
+    // 离屏画布 drawImage 扫描图：写入确定性 RGBA（不透明红 42/0/0/200），
+    // 使导出流程可验证 warp 输出；主画布的 drawImage 不写入缓冲
+    drawImage(img) {
+      if (img && img.__isScan) {
+        const buf = new Uint8ClampedArray(canvas.width * canvas.height * 4);
+        for (let k = 0; k < buf.length; k += 4) { buf[k] = 42; buf[k + 3] = 200; }
+        canvasPixels.set(canvas, buf);
+      }
+    }
+  };
+  // 其余未列举的属性/方法访问一律返回空函数（Proxy 兜底，保持与旧桩一致的宽容度）
+  return new Proxy(ctx, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      return () => {};
+    },
+    set(target, prop, val) { target[prop] = val; return true; }
+  });
 }
 
 function makeEl(tag) {
@@ -39,9 +77,16 @@ function makeEl(tag) {
 function makeCanvas() {
   const el = makeEl('canvas');
   el.width = 300; el.height = 150;
-  el.getContext = () => makeCtx();
+  el.getContext = () => makeCtx(el);
   el.getBoundingClientRect = () => ({ left: 0, top: 0, width: el.width, height: el.height });
   el.toDataURL = () => 'data:image/png;base64,xxxx';
+  // 离屏 canvas：读取扫描图像素（离屏首次绘制时写入确定性缓冲），导出时编码为 PNG blob
+  el.toBlob = (cb, type) => {
+    const buf = canvasPixels.get(el);
+    const body = 'PNG/' + el.width + 'x' + el.height + '/' + (buf ? buf.length : 0) +
+      '/' + (type || 'default') + '/a0=' + (buf ? buf[3] : -1);
+    cb({ type: type || 'image/png', size: buf ? buf.length : 0, text: async () => body });
+  };
   return el;
 }
 
@@ -59,9 +104,16 @@ global.document = {
 };
 global.Affine = require('../public/js/affine.js');
 global.Image = class {
-  constructor() { this.naturalWidth = 960; this.naturalHeight = 640; this.onload = null; }
+  constructor() {
+    this.naturalWidth = 960; this.naturalHeight = 640; this.onload = null;
+    // 载入示例时按 ref、scan 顺序创建两个 Image：第二个（扫描图）打上标记，
+    // 供离屏 canvas 的 drawImage 桩生成确定性 RGBA 缓冲
+    if (global.Image.__createdCount % 2 === 1) this.__isScan = true;
+    global.Image.__createdCount++;
+  }
   set src(v) { setImmediate(() => this.onload && this.onload()); }
 };
+global.Image.__createdCount = 0;
 global.FileReader = class {
   readAsDataURL() { this.result = 'data:image/png;base64,xxxx'; setImmediate(() => this.onload && this.onload()); }
 };
@@ -87,6 +139,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
     assert.ok(htmlIds.has(id), `app.js 引用了 index.html 中不存在的 id: ${id}`);
   }
   assert.ok(els.status.textContent.includes('请上传参考图与扫描图'));
+  assert.ok(els.btnExportImage.disabled, '初始状态（无图像/拟合）应禁用校准图导出');
   console.log('✓ 初始渲染正常，DOM id 与 index.html 一致');
 
   // 1. 载入示例图像
@@ -145,6 +198,29 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(rj.points.every((p) => p.looStatus === 'ok' && Number.isFinite(p.looErrorPx)));
   console.log('✓ 导出残差 JSON 正确（唯一最大残差点标记 + 逐点留出验证）');
 
+  // 4b. 导出校准扫描图 PNG（经典模式）：参考图原始宽高、仅变换后扫描图
+  assert.strictEqual(els.btnExportImage.disabled, false, '拟合有效时应允许导出校准图');
+  fire(els.btnExportImage, 'click');
+  const pngBlob = blobs[2];
+  assert.ok(pngBlob, '应产生导出文件 blob');
+  assert.strictEqual(pngBlob.type, 'image/png', '导出应为 PNG');
+  const pngMeta = await pngBlob.text();
+  assert.ok(pngMeta.startsWith('PNG/960x640/'), 'PNG 画布应与参考图原始宽高一致: ' + pngMeta);
+  assert.ok(pngMeta.includes('/2457600/'), 'PNG 应逐像素填满 960×640×4: ' + pngMeta);
+  assert.ok(els.status.textContent.includes('已导出校准扫描图'), '应提示导出成功: ' + els.status.textContent);
+  assert.ok(els.status.textContent.includes('960×640'));
+  assert.ok(els.status.textContent.includes('经典最小二乘最终矩阵'));
+  assert.ok(els.status.textContent.includes('浏览器本地'), '应说明像素处理留在本地');
+  console.log('✓ 经典模式导出校准扫描图 PNG（960×640，仅变换后的扫描图，本地处理）');
+
+  // 4c. 预览透明度不影响导出：改成 10% 后再次导出，像素仍为扫描图原色（无 globalAlpha）
+  els.opacity.value = '0.1';
+  fire(els.opacity, 'input');
+  fire(els.btnExportImage, 'click');
+  const pngMeta2 = await blobs[3].text();
+  assert.ok(pngMeta2.startsWith('PNG/960x640/'), '透明度变化不影响导出尺寸: ' + pngMeta2);
+  console.log('✓ 导出不受预览透明度影响（不含预览透明度）');
+
   // 5. 右键删除一个点 → 立即重算，剩 3 行
   fire(els.refCanvas, 'contextmenu', { clientX: refPts[0][0], clientY: refPts[0][1], preventDefault() {} });
   assert.strictEqual(rowCount(), 3);
@@ -155,7 +231,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.fitPanel.innerHTML.includes('不可用'));
   // 导出残差 JSON：汇总字段为 null，逐点 looErrorPx 为 null
   fire(els.btnExportResiduals, 'click');
-  const rj3 = JSON.parse(await blobs[2].text());
+  const rj3 = JSON.parse(await blobs[4].text());
   assert.strictEqual(rj3.looValidation.verifiableCount, 0);
   assert.strictEqual(rj3.looValidation.rmse, null);
   assert.strictEqual(rj3.looValidation.maxError, null);
@@ -175,6 +251,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.status.textContent.includes('共线'), '共线应被拒绝: ' + els.status.textContent);
   assert.ok(els.status.className.includes('error'));
   assert.ok(els.btnExportMatrix.disabled, '拟合失败时导出按钮应禁用');
+  assert.ok(els.btnExportImage.disabled, '拟合失败时校准图导出应禁用');
   assert.ok(!els.status.textContent.includes('留出验证'), '拟合失败时不应显示留出验证汇总');
   console.log('✓ 共线控制点被拒绝并提示，导出按钮禁用');
 
@@ -190,6 +267,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.tolerance.disabled === false, '稳健模式开启后容差输入应可用');
   assert.ok(els.status.textContent.includes('非共线'), '稳健模式也应提示无非共线三点: ' + els.status.textContent);
   assert.ok(els.btnExportMatrix.disabled, '无非共线三点时导出必须禁用');
+  assert.ok(els.btnExportImage.disabled, '无非共线三点时校准图导出必须禁用');
   assert.strictEqual(rowCount(), 3, '拒绝拟合时点对应保留');
   console.log('✓ 稳健模式下无非共线三点：说明原因、保留点对、禁用导出');
 
@@ -223,7 +301,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
 
   // 10. 两种导出记录内外点身份，且矩阵为同一最终矩阵
   fire(els.btnExportMatrix, 'click');
-  const mj2 = JSON.parse(await blobs[3].text());
+  const mj2 = JSON.parse(await blobs[5].text());
   assert.strictEqual(mj2.mode, 'robust');
   assert.strictEqual(mj2.rmseScope, 'inliers');
   assert.strictEqual(mj2.inlierCount, 4);
@@ -232,7 +310,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.strictEqual(mj2.looValidation.participantCount, 4, '留出验证参与集应为内点');
   assert.strictEqual(mj2.looValidation.verifiableCount, 4);
   fire(els.btnExportResiduals, 'click');
-  const rj2 = JSON.parse(await blobs[4].text());
+  const rj2 = JSON.parse(await blobs[6].text());
   assert.strictEqual(rj2.points.length, 5);
   assert.strictEqual(rj2.points.filter((p) => p.isInlier).length, 4);
   assert.strictEqual(rj2.points.filter((p) => !p.isInlier).length, 1);
@@ -248,6 +326,15 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
     mm.d * scanPt(refPts[0])[0] + mm.e * scanPt(refPts[0])[1] + mm.f - refPts[0][1]
   ) < 1e-6, '导出矩阵应与叠加预览使用的最终矩阵一致（精确恢复内点映射）');
   console.log('✓ 稳健模式导出：同一最终矩阵 + 逐点内外点身份');
+
+  // 10b. 稳健模式导出校准扫描图 PNG：使用稳健最终矩阵，外点不影响导出
+  assert.strictEqual(els.btnExportImage.disabled, false, '稳健拟合有效时应允许导出校准图');
+  fire(els.btnExportImage, 'click');
+  const pngMetaR = await blobs[7].text();
+  assert.ok(pngMetaR.startsWith('PNG/960x640/'), '稳健模式导出尺寸同样与参考图一致: ' + pngMetaR);
+  assert.ok(els.status.textContent.includes('已导出校准扫描图'));
+  assert.ok(els.status.textContent.includes('稳健模式最终矩阵'), '应说明使用稳健模式最终矩阵');
+  console.log('✓ 稳健模式导出校准扫描图 PNG（两种拟合模式均可导出）');
 
   // 11. 拖动外点标记到正确位置 → 同步重算，变为 5 个内点
   const correct = scanPt([refPts[0][0], refPts[0][1] + 60]);
@@ -272,6 +359,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   fire(els.tolerance, 'input');
   assert.ok(els.status.textContent.includes('像素容差'), '非法容差应说明原因: ' + els.status.textContent);
   assert.ok(els.btnExportMatrix.disabled);
+  assert.ok(els.btnExportImage.disabled, '非法容差导致拟合无效时校准图导出应禁用');
   assert.strictEqual(rowCount(), 5);
   // 恢复合法容差
   els.tolerance.value = '2';
@@ -287,7 +375,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.status.textContent.includes('留出验证 RMSE'), '经典模式同样显示留出验证汇总');
   assert.ok(els.status.textContent.includes('5 点可验证'));
   fire(els.btnExportMatrix, 'click');
-  const mj3 = JSON.parse(await blobs[5].text());
+  const mj3 = JSON.parse(await blobs[8].text());
   assert.strictEqual(mj3.mode, 'leastSquares');
   assert.strictEqual(mj3.rmseScope, 'all');
   assert.strictEqual(mj3.pointCount, 5);

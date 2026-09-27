@@ -8,6 +8,10 @@
  *    再对内点重新最小二乘拟合；外点在双图标记与残差表中区分显示，
  *    不计入 RMSE。容差调整、点位编辑/删除均同步重算。
  *  - 叠加预览与两种 JSON 导出共用同一最终矩阵，导出记录内/外点身份
+ *  - 「导出校准扫描图」：按点击时的最终拟合矩阵对扫描图逐像素逆仿射重采样，
+ *    输出与参考图原始宽高一致的 PNG（仅变换后的扫描图，无参考底图/标记/预览
+ *    透明度）；图像缺失、拟合无效、矩阵非有限或近奇异时按钮禁用，像素处理
+ *    全部在浏览器本地完成（两种拟合模式均可导出）
  *  - 残差实时列表，内点最大残差橙色高亮、外点红色标识；近共线拒绝并提示
  *  - 逐点留出验证（复用 affine.js 的 leaveOneOutValidation，与 /api/fit 输出一致）：
  *    残差表「留出验证」列显示每个参与点的留出误差；参与点不足 4 个或留出后
@@ -52,6 +56,7 @@
   const opacityVal = $('opacityVal');
   const btnExportMatrix = $('btnExportMatrix');
   const btnExportResiduals = $('btnExportResiduals');
+  const btnExportImage = $('btnExportImage');
   const btnClear = $('btnClear');
   const robustModeInput = $('robustMode');
   const toleranceInput = $('tolerance');
@@ -463,6 +468,14 @@
     const hasFit = !!state.fit;
     btnExportMatrix.disabled = !hasFit;
     btnExportResiduals.disabled = !hasFit;
+    // 校准图导出条件更严格：两图齐全 + 拟合有效 + 矩阵有限且可逆；
+    // 点位 / 模式 / 容差变化触发 render() 后按钮状态跟随最新重算结果
+    const imgReady = exportImageReadiness();
+    btnExportImage.disabled = !imgReady.ok;
+    // 禁用时悬停说明具体原因（拟合失败原因同时显示在状态栏）
+    btnExportImage.title = imgReady.ok
+      ? '下载与参考图原始宽高一致的 PNG：仅含按最终拟合矩阵逆变换取样的扫描图，不含参考底图、控制点标记或预览透明度；像素处理全部在浏览器本地完成'
+      : '当前无法导出校准扫描图：' + imgReady.reason;
     btnClear.disabled = state.points.length === 0 && !state.pending.ref && !state.pending.scan;
   }
 
@@ -477,8 +490,7 @@
   }
 
   // ---------- 导出 ----------
-  function downloadJSON(filename, obj) {
-    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  function downloadBlob(filename, blob) {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = filename;
@@ -486,6 +498,11 @@
     a.click();
     a.remove();
     URL.revokeObjectURL(a.href);
+  }
+
+  function downloadJSON(filename, obj) {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+    downloadBlob(filename, blob);
   }
 
   function exportMatrix() {
@@ -548,6 +565,88 @@
       })),
       exportedAt: new Date().toISOString()
     });
+  }
+
+  // ---------- 校准扫描图 PNG 导出（像素处理全部留在浏览器本地） ----------
+  // 导出前就绪检查：图像缺失 / 拟合无效 / 矩阵非有限 / 线性部分退化时禁止导出
+  // （与 renderButtons 共用，按钮禁用状态随每次重算结果更新）
+  function exportImageReadiness() {
+    if (!state.refImg) return { ok: false, reason: '缺少参考图：请先上传参考图（或载入示例图像）。' };
+    if (!state.scanImg) return { ok: false, reason: '缺少扫描图：请先上传扫描图（或载入示例图像）。' };
+    if (state.fitError) return { ok: false, reason: '拟合无效：' + state.fitError };
+    if (!state.fit || !state.fit.matrix) {
+      return {
+        ok: false,
+        reason: state.points.length < Affine.MIN_POINTS
+          ? `拟合无效：至少需要 ${Affine.MIN_POINTS} 对控制点。`
+          : '拟合无效：尚无可用的最终拟合矩阵。'
+      };
+    }
+    const m = state.fit.matrix;
+    if (['a', 'b', 'c', 'd', 'e', 'f'].some((k) => !Number.isFinite(m[k]))) {
+      return { ok: false, reason: '拟合矩阵含非有限值（NaN/Infinity），无法导出，请调整控制点后重新拟合。' };
+    }
+    const det = m.a * m.e - m.b * m.d;
+    if (!Number.isFinite(det) || Math.abs(det) <= Affine.SINGULAR_DET_EPS) {
+      return { ok: false, reason: `拟合矩阵线性部分行列式绝对值 ≤ ${Affine.SINGULAR_DET_EPS}（近奇异，不可逆），无法逆映射取样，请调整点位分布。` };
+    }
+    return { ok: true };
+  }
+
+  // 把扫描图绘制到离屏画布读取 RGBA（不画参考底图与任何标记）
+  function readImageRGBA(img) {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    const g = c.getContext('2d');
+    g.clearRect(0, 0, c.width, c.height);
+    g.drawImage(img, 0, 0);
+    return {
+      width: c.width,
+      height: c.height,
+      data: g.getImageData(0, 0, c.width, c.height).data
+    };
+  }
+
+  function exportCalibratedImage() {
+    // 点击时再次检查：使用点击时刻的扫描图与最终拟合矩阵
+    const ready = exportImageReadiness();
+    if (!ready.ok) {
+      setStatus('无法导出校准扫描图：' + ready.reason, 'error');
+      return;
+    }
+    const m = state.fit.matrix;
+    const refW = state.refImg.naturalWidth;
+    const refH = state.refImg.naturalHeight;
+
+    let warped;
+    try {
+      const src = readImageRGBA(state.scanImg);
+      // 输出与参考图原始宽高一致；逐像素中心逆仿射映射 + 四邻双线性（预乘 alpha）
+      warped = Affine.warpRGBA(src, m, refW, refH);
+    } catch (err) {
+      setStatus('无法导出校准扫描图：' + ((err && err.message) || err || '像素处理失败'), 'error');
+      return;
+    }
+
+    const out = document.createElement('canvas');
+    out.width = refW;
+    out.height = refH;
+    const og = out.getContext('2d');
+    const imageData = new ImageData(warped.data, refW, refH);
+    og.putImageData(imageData, 0, 0); // putImageData 直接写入像素，不含底图/标记/透明度
+    out.toBlob((blob) => {
+      if (!blob) {
+        setStatus('无法导出校准扫描图：PNG 编码失败。', 'error');
+        return;
+      }
+      downloadBlob('calibrated-scan.png', blob);
+      setStatus(
+        `已导出校准扫描图：${refW}×${refH} PNG（与参考图原始宽高一致，仅含变换后的扫描图，` +
+        `${state.robust ? '稳健模式最终矩阵' : '经典最小二乘最终矩阵'}；像素处理在浏览器本地完成）。`,
+        'ok'
+      );
+    }, 'image/png');
   }
 
   // ---------- 示例图像 ----------
@@ -615,6 +714,7 @@
     btnClear.addEventListener('click', clearPoints);
     btnExportMatrix.addEventListener('click', exportMatrix);
     btnExportResiduals.addEventListener('click', exportResiduals);
+    btnExportImage.addEventListener('click', exportCalibratedImage);
 
     opacityInput.addEventListener('input', () => {
       state.opacity = parseFloat(opacityInput.value);
